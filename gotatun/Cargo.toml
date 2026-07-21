@@ -76,6 +76,7 @@ zerocopy = { workspace = true, features = ["derive", "std"] }
 criterion = { workspace = true, features = ["html_reports"] }
 etherparse = { workspace = true }
 test-log = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 tokio-stream = { workspace = true, features = ["sync"] }
 x25519-dalek = { workspace = true, features = ["getrandom"] }
 

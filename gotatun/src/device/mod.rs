@@ -162,6 +162,12 @@ pub(crate) struct Connection<T: DeviceTransports> {
     outgoing: Task,
 }
 
+#[derive(Clone, Copy)]
+enum UdpAddressFamily {
+    Ipv4,
+    Ipv6,
+}
+
 impl<T: DeviceTransports> Connection<T> {
     #[instrument(level = Level::TRACE, skip_all, ret)]
     pub async fn set_up(device_arc: Arc<RwLock<DeviceState<T>>>) -> Result<(), Error> {
@@ -249,6 +255,7 @@ impl<T: DeviceTransports> Connection<T> {
                 buffered_ip_tx.clone(),
                 buffered_udp_tx_v4,
                 buffered_udp_rx_v4,
+                UdpAddressFamily::Ipv4,
                 pool.clone(),
             )
             .map_err(register_fatal_error.clone()),
@@ -260,6 +267,7 @@ impl<T: DeviceTransports> Connection<T> {
                 buffered_ip_tx,
                 buffered_udp_tx_v6,
                 buffered_udp_rx_v6,
+                UdpAddressFamily::Ipv6,
                 pool.clone(),
             )
             .map_err(register_fatal_error.clone()),
@@ -640,6 +648,7 @@ impl<T: DeviceTransports> DeviceState<T> {
         mut tun_tx: impl IpSend,
         udp_tx: impl UdpSend,
         mut udp_rx: impl UdpRecv,
+        address_family: UdpAddressFamily,
         mut packet_pool: PacketBufPool,
     ) -> Result<(), Error> {
         let (private_key, public_key, rate_limiter, mut tun_mtu) = {
@@ -654,7 +663,19 @@ impl<T: DeviceTransports> DeviceState<T> {
             (private_key, public_key, rate_limiter, tun_mtu)
         };
 
-        while let Ok((src_buf, addr)) = udp_rx.recv_from(&mut packet_pool).await {
+        loop {
+            let (src_buf, addr) = match udp_rx.recv_from(&mut packet_pool).await {
+                Ok(packet) => packet,
+                // Linux uses `Unsupported` for a deliberately disabled IPv6 receiver.
+                Err(error)
+                    if matches!(address_family, UdpAddressFamily::Ipv6)
+                        && error.kind() == io::ErrorKind::Unsupported =>
+                {
+                    return Ok(());
+                }
+                Err(error) => return Err(Error::IoError(error)),
+            };
+
             let parsed_packet = match rate_limiter.verify_packet(addr, src_buf) {
                 Ok(packet) => packet,
                 Err(TunnResult::WriteToNetwork(WgKind::CookieReply(cookie))) => {

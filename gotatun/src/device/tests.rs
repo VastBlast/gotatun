@@ -25,6 +25,189 @@ use crate::packet::{Ip, Packet};
 
 pub mod mock;
 
+mod udp_receive_errors {
+    use std::{
+        future::pending,
+        io,
+        net::SocketAddr,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Duration,
+    };
+
+    use tokio::time::timeout;
+    use x25519_dalek::{PublicKey, StaticSecret};
+
+    use crate::{
+        device::{Device, DeviceBuilder, Error, Peer},
+        packet::{Packet, PacketBufPool},
+        udp::{UdpRecv, UdpSend, UdpTransportFactory, UdpTransportFactoryParams},
+    };
+
+    use super::mock;
+
+    const TEST_TIMEOUT: Duration = Duration::from_secs(1);
+    const PENDING_CHECK: Duration = Duration::from_millis(50);
+
+    #[derive(Clone, Copy)]
+    enum ReceiveBehavior {
+        Pending,
+        Error(io::ErrorKind),
+    }
+
+    #[derive(Clone)]
+    struct TestUdpRecv {
+        behavior: ReceiveBehavior,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl UdpRecv for TestUdpRecv {
+        type RecvManyBuf = ();
+
+        async fn recv_from(
+            &mut self,
+            _pool: &mut PacketBufPool,
+        ) -> io::Result<(Packet, SocketAddr)> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            match self.behavior {
+                ReceiveBehavior::Pending => pending().await,
+                ReceiveBehavior::Error(kind) => Err(io::Error::from(kind)),
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct TestUdpSend;
+
+    impl UdpSend for TestUdpSend {
+        type SendManyBuf = ();
+
+        async fn send_to(&self, _packet: Packet, _destination: SocketAddr) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct TestUdpFactory {
+        ipv4: TestUdpRecv,
+        ipv6: TestUdpRecv,
+    }
+
+    impl UdpTransportFactory for TestUdpFactory {
+        type SendV4 = TestUdpSend;
+        type SendV6 = TestUdpSend;
+        type RecvV4 = TestUdpRecv;
+        type RecvV6 = TestUdpRecv;
+
+        async fn bind(
+            &mut self,
+            _params: &UdpTransportFactoryParams,
+        ) -> io::Result<((Self::SendV4, Self::RecvV4), (Self::SendV6, Self::RecvV6))> {
+            Ok((
+                (TestUdpSend, self.ipv4.clone()),
+                (TestUdpSend, self.ipv6.clone()),
+            ))
+        }
+    }
+
+    fn receiver(behavior: ReceiveBehavior) -> (TestUdpRecv, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        (
+            TestUdpRecv {
+                behavior,
+                calls: Arc::clone(&calls),
+            },
+            calls,
+        )
+    }
+
+    async fn build_device(
+        ipv4: TestUdpRecv,
+        ipv6: TestUdpRecv,
+    ) -> (
+        Device<(TestUdpFactory, mock::MockTun, mock::MockTun)>,
+        mock::MockAppTx,
+    ) {
+        let (tun, app_tx, _app_rx) = mock::mock_tun();
+        let peer_key = PublicKey::from(&StaticSecret::random());
+
+        let device = DeviceBuilder::new()
+            .with_udp(TestUdpFactory { ipv4, ipv6 })
+            .with_ip(tun)
+            .with_private_key(StaticSecret::random())
+            .with_peer(Peer::new(peer_key))
+            .build()
+            .await
+            .expect("build test device");
+        (device, app_tx)
+    }
+
+    async fn wait_for_calls(counters: &[Arc<AtomicUsize>], minimum: usize) {
+        timeout(TEST_TIMEOUT, async {
+            while counters
+                .iter()
+                .any(|calls| calls.load(Ordering::Relaxed) < minimum)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("timed out waiting for UDP receive calls");
+    }
+
+    #[tokio::test]
+    async fn unexpected_receive_errors_are_fatal() {
+        for kind in [io::ErrorKind::InvalidData, io::ErrorKind::Unsupported] {
+            let (ipv4, _calls) = receiver(ReceiveBehavior::Error(kind));
+            let (ipv6, _calls) = receiver(ReceiveBehavior::Pending);
+            let (mut device, _app_tx) = build_device(ipv4, ipv6).await;
+
+            timeout(TEST_TIMEOUT, device.wait())
+                .await
+                .expect("terminal UDP receive error did not become fatal");
+            assert!(matches!(
+                device.fatal_error.borrow().as_ref(),
+                Some(Error::IoError(error)) if error.kind() == kind
+            ));
+
+            device.stop().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn unsupported_receive_error_is_not_fatal() {
+        let (ipv4, ipv4_calls) = receiver(ReceiveBehavior::Pending);
+        let (ipv6, ipv6_calls) = receiver(ReceiveBehavior::Error(io::ErrorKind::Unsupported));
+        let (mut device, _app_tx) = build_device(ipv4, ipv6).await;
+
+        wait_for_calls(&[ipv4_calls, ipv6_calls], 1).await;
+        assert!(
+            timeout(PENDING_CHECK, device.wait()).await.is_err(),
+            "Unsupported UDP receive error became fatal"
+        );
+        assert!(device.fatal_error.borrow().is_none());
+
+        device.stop().await;
+    }
+
+    #[tokio::test]
+    async fn dual_stack_network_down_retries_without_becoming_fatal() {
+        let (ipv4, ipv4_calls) = receiver(ReceiveBehavior::Error(io::ErrorKind::NetworkDown));
+        let (ipv6, ipv6_calls) = receiver(ReceiveBehavior::Error(io::ErrorKind::NetworkDown));
+        let (mut device, _app_tx) = build_device(ipv4, ipv6).await;
+
+        wait_for_calls(&[ipv4_calls, ipv6_calls], 2).await;
+        assert!(
+            timeout(PENDING_CHECK, device.wait()).await.is_err(),
+            "recoverable UDP receive errors became fatal"
+        );
+        assert!(device.fatal_error.borrow().is_none());
+
+        device.stop().await;
+    }
+}
+
 /// Assert that the expected number of packets is sent.
 /// We expect there to be [`packet_count`] data packets, one handshake init,
 /// one handshake resp, and one keepalive.
